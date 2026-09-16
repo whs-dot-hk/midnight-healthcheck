@@ -1,0 +1,15 @@
+[Unit]
+Description=Run the Midnight FNO healthcheck every 5 minutes
+Documentation=https://github.com/whs-dot-hk/midnight-healthcheck
+
+[Timer]
+OnBootSec=3min
+# `progress` compares against the previous run, so this interval is also the
+# window the block-rate delta is measured over. Shorter makes the rate noisy;
+# much longer delays noticing a stall.
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=midnight-healthcheck.service
+
+[Install]
+WantedBy=timers.target

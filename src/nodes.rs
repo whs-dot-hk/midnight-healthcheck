@@ -27,7 +27,7 @@ pub fn param_str(params: &Value, key: &str, env_key: &str, default: &str) -> Str
     env::var(env_key).ok().filter(|s| !s.is_empty()).unwrap_or_else(|| default.to_string())
 }
 
-fn param_u64(params: &Value, key: &str, env_key: &str, default: u64) -> u64 {
+pub(crate) fn param_u64(params: &Value, key: &str, env_key: &str, default: u64) -> u64 {
     params
         .get(key)
         .and_then(|v| v.as_u64())
@@ -75,13 +75,22 @@ fn parse_http_url(url: &str) -> Result<Url, String> {
 
 fn http_exchange(url: &str, method: &str, content_type: &str, body: &[u8]) -> Result<(u16, String), String> {
     let u = parse_http_url(url)?;
-    let mut stream = TcpStream::connect((u.host.as_str(), u.port)).map_err(|e| format!("connect {url}: {e}"))?;
+    // A plain connect() has no timeout of its own: against a host that drops SYNs
+    // it blocks for the kernel's retry budget (minutes), long enough to outlast any
+    // SSH wrapper or timer. Resolve, then connect with the same budget as the I/O.
+    use std::net::ToSocketAddrs;
+    let addr = (u.host.as_str(), u.port)
+        .to_socket_addrs()
+        .map_err(|e| format!("resolve {url}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("resolve {url}: no address"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, HTTP_TIMEOUT).map_err(|e| format!("connect {url}: {e}"))?;
     stream
         .set_read_timeout(Some(HTTP_TIMEOUT))
         .and_then(|_| stream.set_write_timeout(Some(HTTP_TIMEOUT)))
         .map_err(|e| e.to_string())?;
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: healthcheck\r\nAccept: */*\r\nConnection: close\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: midnight-healthcheck\r\nAccept: */*\r\nConnection: close\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\n\r\n",
         path = u.path, host = u.host, port = u.port, len = body.len(),
     );
     stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
@@ -110,7 +119,7 @@ fn http_post_json(url: &str, payload: &Value) -> Result<Value, String> {
     serde_json::from_str(&body).map_err(|e| format!("json: {e}"))
 }
 
-fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value, String> {
+pub(crate) fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value, String> {
     let resp = http_post_json(url, &json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))?;
     if let Some(err) = resp.get("error") {
         return Err(err.to_string());
@@ -121,11 +130,17 @@ fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value, String> {
 fn processes_matching(needles: &[&str]) -> Vec<Value> {
     let mut found = Vec::new();
     let Ok(dir) = fs::read_dir("/proc") else { return found };
+    // The binary is now called midnight-healthcheck, so a needle like "midnight"
+    // would match this very process (and the sudo/ssh wrappers carrying its name)
+    let me = std::process::id();
     for ent in dir.flatten() {
         let pid: u32 = match ent.file_name().to_string_lossy().parse() {
             Ok(p) => p,
             Err(_) => continue,
         };
+        if pid == me {
+            continue;
+        }
         let comm = fs::read_to_string(ent.path().join("comm")).unwrap_or_default();
         let comm = comm.trim();
         let cmdline = fs::read(ent.path().join("cmdline"))
@@ -139,7 +154,7 @@ fn processes_matching(needles: &[&str]) -> Vec<Value> {
     found
 }
 
-fn unit_active(unit: &str) -> Option<bool> {
+pub(crate) fn unit_active(unit: &str) -> Option<bool> {
     let out = Command::new("systemctl").args(["is-active", unit]).output().ok()?;
     let s = String::from_utf8_lossy(&out.stdout);
     Some(s.trim() == "active")
@@ -162,7 +177,7 @@ fn prom_metric(body: &str, name: &str) -> Option<f64> {
     None
 }
 
-fn run_cmd(bin: &str, args: &[&str], extra_env: &[(&str, String)]) -> Result<String, String> {
+pub(crate) fn run_cmd(bin: &str, args: &[&str], extra_env: &[(&str, String)]) -> Result<String, String> {
     let mut c = Command::new(bin);
     c.args(args);
     for (k, v) in extra_env {
@@ -176,7 +191,7 @@ fn run_cmd(bin: &str, args: &[&str], extra_env: &[(&str, String)]) -> Result<Str
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-fn hex_u64(v: &Value) -> Option<u64> {
+pub(crate) fn hex_u64(v: &Value) -> Option<u64> {
     match v {
         Value::String(s) => u64::from_str_radix(s.trim_start_matches("0x"), 16).ok(),
         Value::Number(n) => n.as_u64(),
@@ -195,7 +210,7 @@ fn unquote(raw: &str) -> String {
     raw.to_string()
 }
 
-fn load_env_file(path: &str) -> std::collections::HashMap<String, String> {
+pub(crate) fn load_env_file(path: &str) -> std::collections::HashMap<String, String> {
     let mut m = std::collections::HashMap::new();
     let Ok(s) = fs::read_to_string(path) else { return m };
     for line in s.lines() {
@@ -262,12 +277,19 @@ fn substrate(name: &str, params: &Value, default_url: &str, env_url: &str, needl
             if should_have_peers && peers < min_peers {
                 status = "fail";
                 reason = format!("peers {peers} < min {min_peers}");
-            } else if is_syncing {
-                status = if lag.unwrap_or(0) > 50 { "fail" } else { "warn" };
-                reason = format!("syncing (block {:?}, lag {:?})", block_height, lag);
             } else if procs.is_empty() {
                 status = "warn";
                 reason = "rpc ok but process not found in /proc".into();
+            } else if is_syncing {
+                // Catching up is the normal state of a new node, and an initial sync
+                // runs for days: alarming on it would mean alarming continuously
+                // while nothing is wrong. Whether it is *advancing* is the question
+                // that matters; the caller decides that against the previous run.
+                reason = match (block_height, lag) {
+                    (Some(b), Some(l)) => format!("syncing: block {b}, {l} behind"),
+                    (Some(b), None) => format!("syncing: block {b}"),
+                    _ => "syncing".into(),
+                };
             }
             wrap(name, status, &reason, extra)
         }
@@ -276,22 +298,42 @@ fn substrate(name: &str, params: &Value, default_url: &str, env_url: &str, needl
 }
 
 pub fn check_midnight(params: &Value) -> Value {
+    // The installer's unit uses 9944, the interactive setup script uses 9933. Probe
+    // for whichever is actually listening: reporting a healthy node as down because
+    // the port was assumed is the most misleading failure this tool could produce.
+    let probed = crate::verify::midnight_rpc_url(params);
     let mut r = substrate(
         "midnight",
         params,
-        "http://127.0.0.1:9944",
+        &probed,
         "MIDNIGHT_RPC_URL",
-        &["midnight-node", "midnight", "partner-chains-node"],
+        &["midnight-node", "partner-chains-node"],
     );
     if r.get("status").and_then(|s| s.as_str()) == Some("fail") {
         if let Some(false) = unit_active("midnight-node.service") {
             r["reason"] = json!(format!("{}; midnight-node.service not active", r["reason"].as_str().unwrap_or("")));
         }
     }
+    // A syncing node is only fine if it is *moving*. This check must be able to say
+    // so on its own — a monitor polling just `midnight` gets no help from `progress`
+    // — so it judges against its own slot in the state file. Its own slot, so that
+    // running alongside `progress` in one `health` call disturbs neither baseline.
+    if r.get("status").and_then(|s| s.as_str()) == Some("ok")
+        && r.get("is_syncing").and_then(|v| v.as_bool()) == Some(true)
+    {
+        let reading = crate::trend::midnight_reading(params);
+        let verdict = crate::trend::component("midnight_check", "midnight-node", &reading);
+        if verdict.status == "fail" {
+            r["status"] = json!("fail");
+            r["healthy"] = json!(false);
+        }
+        r["reason"] = json!(verdict.detail);
+        r["advancing"] = verdict.extra.get("advancing").cloned().unwrap_or(Value::Null);
+    }
     r
 }
 
-fn cardano_network_args(params: &Value) -> Vec<String> {
+pub(crate) fn cardano_network_args(params: &Value) -> Vec<String> {
     let magic = param_str(params, "testnet_magic", "CARDANO_TESTNET_MAGIC", "");
     if !magic.is_empty() {
         return vec!["--testnet-magic".into(), magic];
@@ -345,7 +387,14 @@ pub fn check_cardano_node(params: &Value) -> Value {
         let mut args = vec!["query".into(), "tip".into(), "--socket-path".into(), socket.clone()];
         args.extend(cardano_network_args(params));
         let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        match run_cmd("cardano-cli", &refs, &[]) {
+        let user = crate::trend::cardano_user(params);
+        let cli = crate::trend::resolve_binary(
+            params,
+            "cardano_cli",
+            "CARDANO_CLI",
+            &crate::trend::cardano_cli_candidates(&user),
+        );
+        match run_cmd(&cli, &refs, &[]) {
             Ok(out) => {
                 tip = serde_json::from_str(out.trim()).unwrap_or(json!(out.trim()));
                 if block_height.is_none() {
@@ -386,8 +435,15 @@ pub fn check_cardano_node(params: &Value) -> Value {
     } else if !running {
         status = "warn";
         reasons.push("process not found".into());
-    } else if !prom_ok {
+    } else if !prom_ok && block_height.is_none() {
+        // Only a problem when it was the only way to see the node
         status = "warn";
+    }
+    if block_height.is_some() && !prom_ok {
+        // The tip answered, so the node is not down — but peers come only from
+        // Prometheus, and an unknown peer count must be said, not silently dropped
+        reasons.retain(|r| !r.starts_with("prometheus"));
+        reasons.push("prometheus unreachable: peer count unknown".into());
     }
     if reasons.is_empty() {
         reasons.push(match block_height {
@@ -423,6 +479,18 @@ fn parse_pg_row(s: &str) -> Option<(i64, i64)> {
     let a = it.next()?.trim().parse().ok()?;
     let b = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0);
     Some((a, b))
+}
+
+/// The db-sync database, resolved the same way everywhere: explicit param, then
+/// `PGDATABASE`, then the credentials file the setup script writes, then the default
+pub(crate) fn db_name(params: &Value) -> String {
+    let creds = load_env_file(&param_str(params, "creds", "FNO_DB_CREDENTIALS", DEFAULT_CREDS));
+    param_str(
+        params,
+        "database",
+        "PGDATABASE",
+        creds.get("DB_NAME").map(|s| s.as_str()).unwrap_or("cexplorer"),
+    )
 }
 
 pub fn check_db_sync(params: &Value) -> Value {

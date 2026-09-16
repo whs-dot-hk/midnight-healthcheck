@@ -1,7 +1,7 @@
 //! JSON-RPC 2.0 healthcheck over stdin/stdout (SSH-friendly).
 //!
-//!   ssh user@host healthcheck
-//!   echo '{"jsonrpc":"2.0","id":1,"method":"health"}' | ssh user@host healthcheck
+//!   ssh user@host midnight-healthcheck
+//!   echo '{"jsonrpc":"2.0","id":1,"method":"health"}' | ssh user@host midnight-healthcheck
 //!
 //! Each check is just: is this component healthy? (`ok` / `warn` / `fail`)
 //!
@@ -11,11 +11,17 @@
 //! | midnight         | Midnight Substrate RPC (`MIDNIGHT_RPC_URL`, default http://127.0.0.1:9944) |
 //! | cardano_node     | systemd/process + Prometheus + optional `cardano-cli query tip` |
 //! | cardano_db_sync  | process + postgres `max(block_no)` vs node tip |
+//! | progress         | is it *moving*? deltas against the previous run — the check that separates "catching up" from "wedged" |
+//! | chain_identity   | genesis + version against the live network, not against a pin |
+//! | binaries         | running image vs the binary on disk (`enable --now` does not restart) |
+//! | secrets          | key material present and owner-only |
 //!
 //! Layout matches https://github.com/whs-dot-hk/midnight-installer
 //! (`/data/cardano/db/node.socket`, `/data/postgresql/fno-db-credentials.env`, preprod).
 
 mod nodes;
+mod trend;
+mod verify;
 
 use serde_json::{json, Value};
 use std::env;
@@ -34,6 +40,10 @@ const CHECKS: &[&str] = &[
     "midnight",
     "cardano_node",
     "cardano_db_sync",
+    "progress",
+    "chain_identity",
+    "binaries",
+    "secrets",
 ];
 
 fn now_unix() -> f64 {
@@ -166,7 +176,7 @@ fn worst(ss: impl IntoIterator<Item = String>) -> String {
     out
 }
 
-fn wrap(name: &str, status: &str, reason: &str, extra: Value) -> Value {
+pub(crate) fn wrap(name: &str, status: &str, reason: &str, extra: Value) -> Value {
     let info = INFO_CHECKS.contains(&name);
     let mut o = json!({
         "name": name,
@@ -262,6 +272,10 @@ fn run_check(name: &str, params: &Value) -> Value {
         "midnight" => nodes::check_midnight(params),
         "cardano_node" => nodes::check_cardano_node(params),
         "cardano_db_sync" => nodes::check_db_sync(params),
+        "progress" => trend::check(params),
+        "chain_identity" => verify::check_chain_identity(params),
+        "binaries" => verify::check_binaries(params),
+        "secrets" => verify::check_secrets(params),
         _ => wrap(name, "fail", "unknown check", json!({})),
     }
 }
@@ -357,6 +371,10 @@ fn handle_request(req: &Value) -> Option<Value> {
                 "midnight": "Midnight Substrate RPC (MIDNIGHT_RPC_URL, default http://127.0.0.1:9944)",
                 "cardano_node": "cardano-node process + Prometheus + optional cardano-cli tip",
                 "cardano_db_sync": "cardano-db-sync process + postgres block tip vs node",
+                "progress": "is each component actually advancing? compares against the previous run (state file); a component behind the tip and not moving is a failure",
+                "chain_identity": "local genesis and version vs the live network (MIDNIGHT_NETWORK_RPC_URL)",
+                "binaries": "is each unit running the binary that is on disk, or one replaced under it?",
+                "secrets": "validator key material: present, and readable only by its owner",
             },
             "transport": "line-delimited JSON-RPC 2.0 on stdin/stdout",
         }),
@@ -419,16 +437,21 @@ fn serve() -> i32 {
 
 fn help() {
     print!(
-        "healthcheck — JSON-RPC 2.0 over stdio\n\
+        "midnight-healthcheck — JSON-RPC 2.0 over stdio\n\
          \n\
-         Usage: healthcheck [--once] [--help]\n\
-         SSH:   ssh user@host healthcheck\n\
-                echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"health\"}}' | ssh user@host healthcheck\n\
+         Usage: midnight-healthcheck [--once] [--help]\n\
+         SSH:   ssh user@host midnight-healthcheck\n\
+                echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"health\"}}' | ssh user@host midnight-healthcheck\n\
          \n\
          Methods: ping, health, checks, check, sysinfo, help\n\
-         Checks:  disk, memory, load, uptime, midnight, cardano_node, cardano_db_sync\n\
+         Checks:  disk, memory, load, uptime, midnight, cardano_node, cardano_db_sync,\n\
+                  progress, chain_identity, binaries, secrets\n\
          \n\
-         Env: MIDNIGHT_RPC_URL\n\
+         Env: MIDNIGHT_RPC_URL (default: probe 127.0.0.1:9944, then :9933)\n\
+              MIDNIGHT_NETWORK_RPC_URL (default https://rpc.preprod.midnight.network)\n\
+              CARDANO_USER (default: User= of cardano-node.service)  CARDANO_CLI\n\
+              MIDNIGHT_NODE_DATA (default /data/midnight_node)  MIDNIGHT_CHAIN_ID (default midnight_preprod)\n\
+              HEALTHCHECK_STATE (default /var/lib/midnight-healthcheck/state.json)\n\
               CARDANO_NODE_SOCKET_PATH (default /data/cardano/db/node.socket)\n\
               CARDANO_PROMETHEUS_URL (default http://127.0.0.1:12798/metrics)\n\
               CARDANO_NETWORK (default preprod) CARDANO_TESTNET_MAGIC (default 1)\n\

@@ -1,11 +1,11 @@
 [package]
-name = "healthcheck"
+name = "midnight-healthcheck"
 version = "1.2.0"
 edition = "2021"
 description = "JSON-RPC 2.0 healthcheck over stdio: host + Midnight, cardano-node, db-sync"
 
 [[bin]]
-name = "healthcheck"
+name = "midnight-healthcheck"
 path = "src/main.rs"
 
 [dependencies]
