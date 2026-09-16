@@ -1,7 +1,7 @@
 //! JSON-RPC 2.0 healthcheck over stdin/stdout (SSH-friendly).
 //!
-//!   ssh user@host healthcheck
-//!   echo '{"jsonrpc":"2.0","id":1,"method":"health"}' | ssh user@host healthcheck
+//!   ssh user@host midnight-healthcheck
+//!   echo '{"jsonrpc":"2.0","id":1,"method":"health"}' | ssh user@host midnight-healthcheck
 //!
 //! Each check is just: is this component healthy? (`ok` / `warn` / `fail`)
 //!
@@ -437,11 +437,11 @@ fn serve() -> i32 {
 
 fn help() {
     print!(
-        "healthcheck — JSON-RPC 2.0 over stdio\n\
+        "midnight-healthcheck — JSON-RPC 2.0 over stdio\n\
          \n\
-         Usage: healthcheck [--once] [--help]\n\
-         SSH:   ssh user@host healthcheck\n\
-                echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"health\"}}' | ssh user@host healthcheck\n\
+         Usage: midnight-healthcheck [--once] [--help]\n\
+         SSH:   ssh user@host midnight-healthcheck\n\
+                echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"health\"}}' | ssh user@host midnight-healthcheck\n\
          \n\
          Methods: ping, health, checks, check, sysinfo, help\n\
          Checks:  disk, memory, load, uptime, midnight, cardano_node, cardano_db_sync\n\

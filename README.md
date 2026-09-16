@@ -7,8 +7,8 @@ Speaks line-delimited JSON-RPC 2.0 on stdin/stdout, so it works over plain SSH w
 and no open port:
 
 ```bash
-ssh node 'sudo healthcheck --once'
-echo '{"jsonrpc":"2.0","id":1,"method":"check","params":{"name":"progress"}}' | ssh node sudo healthcheck
+ssh node 'sudo midnight-healthcheck --once'
+echo '{"jsonrpc":"2.0","id":1,"method":"check","params":{"name":"progress"}}' | ssh node sudo midnight-healthcheck
 ```
 
 Exit code with `--once`: `0` healthy, `2` something failed.
@@ -67,8 +67,8 @@ for deciding whether anything moved at all.
 Needs root, for the journal, the Cardano socket, `psql`, and the key-material modes.
 
 ```bash
-sudo healthcheck --once | jq .
-sudo healthcheck --once | jq -r '.result | .status, (.checks[] | "\(.status)\t\(.name)\t\(.reason)")'
+sudo midnight-healthcheck --once | jq .
+sudo midnight-healthcheck --once | jq -r '.result | .status, (.checks[] | "\(.status)\t\(.name)\t\(.reason)")'
 ```
 
 Every path and URL has a default matching the FNO layout, overridable by env var or by an RPC
@@ -92,7 +92,7 @@ lookup.
 ## On a timer
 
 ```bash
-sudo install -m0755 healthcheck /usr/local/bin/healthcheck
+sudo install -m0755 target/release/midnight-healthcheck /usr/local/bin/midnight-healthcheck
 sudo install -m0644 systemd/midnight-healthcheck.service systemd/midnight-healthcheck.timer /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now midnight-healthcheck.timer
 

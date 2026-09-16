@@ -8,7 +8,7 @@ Type=oneshot
 # Root: the journal, the Cardano socket, psql, and the modes on key material are
 # all out of reach otherwise
 User=root
-ExecStart=/usr/local/bin/healthcheck --once
+ExecStart=/usr/local/bin/midnight-healthcheck --once
 # A failing check is a finding, not a broken unit: let the timer keep running and
 # leave the verdict in the journal for whatever is reading it
 SuccessExitStatus=0 2

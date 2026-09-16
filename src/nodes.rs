@@ -81,7 +81,7 @@ fn http_exchange(url: &str, method: &str, content_type: &str, body: &[u8]) -> Re
         .and_then(|_| stream.set_write_timeout(Some(HTTP_TIMEOUT)))
         .map_err(|e| e.to_string())?;
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: healthcheck\r\nAccept: */*\r\nConnection: close\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: midnight-healthcheck\r\nAccept: */*\r\nConnection: close\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\n\r\n",
         path = u.path, host = u.host, port = u.port, len = body.len(),
     );
     stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
