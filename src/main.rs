@@ -11,11 +11,17 @@
 //! | midnight         | Midnight Substrate RPC (`MIDNIGHT_RPC_URL`, default http://127.0.0.1:9944) |
 //! | cardano_node     | systemd/process + Prometheus + optional `cardano-cli query tip` |
 //! | cardano_db_sync  | process + postgres `max(block_no)` vs node tip |
+//! | progress         | is it *moving*? deltas against the previous run — the check that separates "catching up" from "wedged" |
+//! | chain_identity   | genesis + version against the live network, not against a pin |
+//! | binaries         | running image vs the binary on disk (`enable --now` does not restart) |
+//! | secrets          | key material present and owner-only |
 //!
 //! Layout matches https://github.com/whs-dot-hk/midnight-installer
 //! (`/data/cardano/db/node.socket`, `/data/postgresql/fno-db-credentials.env`, preprod).
 
 mod nodes;
+mod trend;
+mod verify;
 
 use serde_json::{json, Value};
 use std::env;
@@ -34,6 +40,10 @@ const CHECKS: &[&str] = &[
     "midnight",
     "cardano_node",
     "cardano_db_sync",
+    "progress",
+    "chain_identity",
+    "binaries",
+    "secrets",
 ];
 
 fn now_unix() -> f64 {
@@ -166,7 +176,7 @@ fn worst(ss: impl IntoIterator<Item = String>) -> String {
     out
 }
 
-fn wrap(name: &str, status: &str, reason: &str, extra: Value) -> Value {
+pub(crate) fn wrap(name: &str, status: &str, reason: &str, extra: Value) -> Value {
     let info = INFO_CHECKS.contains(&name);
     let mut o = json!({
         "name": name,
@@ -262,6 +272,10 @@ fn run_check(name: &str, params: &Value) -> Value {
         "midnight" => nodes::check_midnight(params),
         "cardano_node" => nodes::check_cardano_node(params),
         "cardano_db_sync" => nodes::check_db_sync(params),
+        "progress" => trend::check(params),
+        "chain_identity" => verify::check_chain_identity(params),
+        "binaries" => verify::check_binaries(params),
+        "secrets" => verify::check_secrets(params),
         _ => wrap(name, "fail", "unknown check", json!({})),
     }
 }
@@ -357,6 +371,10 @@ fn handle_request(req: &Value) -> Option<Value> {
                 "midnight": "Midnight Substrate RPC (MIDNIGHT_RPC_URL, default http://127.0.0.1:9944)",
                 "cardano_node": "cardano-node process + Prometheus + optional cardano-cli tip",
                 "cardano_db_sync": "cardano-db-sync process + postgres block tip vs node",
+                "progress": "is each component actually advancing? compares against the previous run (state file); a component behind the tip and not moving is a failure",
+                "chain_identity": "local genesis and version vs the live network (MIDNIGHT_NETWORK_RPC_URL)",
+                "binaries": "is each unit running the binary that is on disk, or one replaced under it?",
+                "secrets": "validator key material: present, and readable only by its owner",
             },
             "transport": "line-delimited JSON-RPC 2.0 on stdin/stdout",
         }),

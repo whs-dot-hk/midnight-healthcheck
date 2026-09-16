@@ -27,7 +27,7 @@ pub fn param_str(params: &Value, key: &str, env_key: &str, default: &str) -> Str
     env::var(env_key).ok().filter(|s| !s.is_empty()).unwrap_or_else(|| default.to_string())
 }
 
-fn param_u64(params: &Value, key: &str, env_key: &str, default: u64) -> u64 {
+pub(crate) fn param_u64(params: &Value, key: &str, env_key: &str, default: u64) -> u64 {
     params
         .get(key)
         .and_then(|v| v.as_u64())
@@ -110,7 +110,7 @@ fn http_post_json(url: &str, payload: &Value) -> Result<Value, String> {
     serde_json::from_str(&body).map_err(|e| format!("json: {e}"))
 }
 
-fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value, String> {
+pub(crate) fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value, String> {
     let resp = http_post_json(url, &json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))?;
     if let Some(err) = resp.get("error") {
         return Err(err.to_string());
@@ -139,7 +139,7 @@ fn processes_matching(needles: &[&str]) -> Vec<Value> {
     found
 }
 
-fn unit_active(unit: &str) -> Option<bool> {
+pub(crate) fn unit_active(unit: &str) -> Option<bool> {
     let out = Command::new("systemctl").args(["is-active", unit]).output().ok()?;
     let s = String::from_utf8_lossy(&out.stdout);
     Some(s.trim() == "active")
@@ -162,7 +162,7 @@ fn prom_metric(body: &str, name: &str) -> Option<f64> {
     None
 }
 
-fn run_cmd(bin: &str, args: &[&str], extra_env: &[(&str, String)]) -> Result<String, String> {
+pub(crate) fn run_cmd(bin: &str, args: &[&str], extra_env: &[(&str, String)]) -> Result<String, String> {
     let mut c = Command::new(bin);
     c.args(args);
     for (k, v) in extra_env {
@@ -176,7 +176,7 @@ fn run_cmd(bin: &str, args: &[&str], extra_env: &[(&str, String)]) -> Result<Str
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-fn hex_u64(v: &Value) -> Option<u64> {
+pub(crate) fn hex_u64(v: &Value) -> Option<u64> {
     match v {
         Value::String(s) => u64::from_str_radix(s.trim_start_matches("0x"), 16).ok(),
         Value::Number(n) => n.as_u64(),
@@ -195,7 +195,7 @@ fn unquote(raw: &str) -> String {
     raw.to_string()
 }
 
-fn load_env_file(path: &str) -> std::collections::HashMap<String, String> {
+pub(crate) fn load_env_file(path: &str) -> std::collections::HashMap<String, String> {
     let mut m = std::collections::HashMap::new();
     let Ok(s) = fs::read_to_string(path) else { return m };
     for line in s.lines() {
@@ -263,8 +263,20 @@ fn substrate(name: &str, params: &Value, default_url: &str, env_url: &str, needl
                 status = "fail";
                 reason = format!("peers {peers} < min {min_peers}");
             } else if is_syncing {
-                status = if lag.unwrap_or(0) > 50 { "fail" } else { "warn" };
-                reason = format!("syncing (block {:?}, lag {:?})", block_height, lag);
+                // Catching up is the normal state of a new node, and an initial sync
+                // runs for days: alarming on it would mean alarming continuously
+                // while nothing is wrong. Whether it is *advancing* is the question
+                // that matters, and the `progress` check is the one that can answer
+                // it — it compares against the previous run rather than guessing
+                // from a single reading.
+                status = "ok";
+                reason = match (block_height, lag) {
+                    (Some(b), Some(l)) => {
+                        format!("syncing: block {b}, {l} behind (see `progress` for whether it is advancing)")
+                    }
+                    (Some(b), None) => format!("syncing: block {b}"),
+                    _ => "syncing".into(),
+                };
             } else if procs.is_empty() {
                 status = "warn";
                 reason = "rpc ok but process not found in /proc".into();
@@ -276,10 +288,14 @@ fn substrate(name: &str, params: &Value, default_url: &str, env_url: &str, needl
 }
 
 pub fn check_midnight(params: &Value) -> Value {
+    // The installer's unit uses 9944, the interactive setup script uses 9933. Probe
+    // for whichever is actually listening: reporting a healthy node as down because
+    // the port was assumed is the most misleading failure this tool could produce.
+    let probed = crate::verify::midnight_rpc_url(params);
     let mut r = substrate(
         "midnight",
         params,
-        "http://127.0.0.1:9944",
+        &probed,
         "MIDNIGHT_RPC_URL",
         &["midnight-node", "midnight", "partner-chains-node"],
     );
@@ -345,7 +361,17 @@ pub fn check_cardano_node(params: &Value) -> Value {
         let mut args = vec!["query".into(), "tip".into(), "--socket-path".into(), socket.clone()];
         args.extend(cardano_network_args(params));
         let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        match run_cmd("cardano-cli", &refs, &[]) {
+        let cli = crate::trend::resolve_binary(
+            params,
+            "cardano_cli",
+            "CARDANO_CLI",
+            &[
+                "/home/midnight/.local/bin/cardano-cli",
+                "/usr/local/bin/cardano-cli",
+                "/usr/bin/cardano-cli",
+            ],
+        );
+        match run_cmd(&cli, &refs, &[]) {
             Ok(out) => {
                 tip = serde_json::from_str(out.trim()).unwrap_or(json!(out.trim()));
                 if block_height.is_none() {
@@ -386,8 +412,12 @@ pub fn check_cardano_node(params: &Value) -> Value {
     } else if !running {
         status = "warn";
         reasons.push("process not found".into());
-    } else if !prom_ok {
+    } else if !prom_ok && block_height.is_none() {
+        // Only a problem when it was the only way to see the node
         status = "warn";
+    }
+    if block_height.is_some() {
+        reasons.retain(|r| !r.starts_with("prometheus"));
     }
     if reasons.is_empty() {
         reasons.push(match block_height {
