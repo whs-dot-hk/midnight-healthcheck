@@ -113,6 +113,87 @@ script defaults it to whoever ran it.
 Every connection has a connect timeout as well as an I/O timeout, and the RPC port is probed
 once per process, so a hung or firewalled endpoint costs one timeout, not one per check.
 
+## Responses
+
+Line-delimited JSON-RPC 2.0: one request per line in, one response per line out. The examples
+below are real output with host-identifying values replaced by placeholders — block heights,
+hashes and hostnames from your own node will differ.
+
+Every response is a standard envelope. Errors use the usual codes:
+
+```json
+{"jsonrpc":"2.0","id":2,"result":{"checks":["disk","memory","load","uptime","midnight",
+ "cardano_node","cardano_db_sync","progress","chain_identity","binaries","secrets"]}}
+
+{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method not found: nope"}}
+```
+
+`health` runs every check and wraps the results:
+
+```json
+{"jsonrpc":"2.0","id":5,"result":{
+  "status":"ok","healthy":true,"checked_at":"<rfc3339>","checks":[ … ]}}
+```
+
+Every check body carries the same four fields — `name`, `status` (`ok` / `warn` / `fail`),
+`healthy` (true unless `fail`), and `reason` — then adds its own. `chain_identity` reports
+**both sides of every comparison**, so the output shows why it passed, not just that it did:
+
+```json
+{"name":"chain_identity","status":"ok","healthy":true,"kind":"health",
+ "reason":"on the same chain as https://rpc.preprod.midnight.network (genesis 0xdf83…361b, 1.0.2-<build>)",
+ "local_url":"http://127.0.0.1:9933",
+ "network_url":"https://rpc.preprod.midnight.network",
+ "local_genesis":"0xdf83…361b","network_genesis":"0xdf83…361b",
+ "local_version":"1.0.2-<build>","network_version":"1.0.2-<build>"}
+```
+
+`progress` nests one object per component, each with the machine-readable verdict beside the
+prose. Note `advancing` is **three-state** — `true` moving, `false` stalled, `null` not yet
+determined — and is never collapsed to a boolean, because "I could not tell" and "it is not
+moving" are different answers:
+
+```json
+{"name":"progress","status":"ok","healthy":true,
+ "state_file":"/var/lib/midnight-healthcheck/state.json",
+ "reason":"cardano-node: at the tip (block 5182990); midnight-node: behind at block 528749; no verdict yet (0s since baseline, need 45s)",
+ "components":{
+   "cardano_node":  {"status":"ok","block":5182990,"at_tip":true,"advancing":true,
+                     "detail":"cardano-node: at the tip (block 5182990)"},
+   "midnight_node": {"status":"ok","block":528749,"at_tip":false,"advancing":null,
+                     "interval_secs":0.26,
+                     "detail":"midnight-node: behind at block 528749; no verdict yet (0s since baseline, need 45s)"}}}
+```
+
+A stall — the failure the tool exists for. `previous_block` and `interval_secs` are included
+so an alert can show its own evidence rather than asserting:
+
+```json
+{"name":"progress","status":"fail","healthy":false,
+ "reason":"cardano-node: STALLED at block 100 — no progress in 300s while still behind the tip",
+ "components":{
+   "cardano_node":{"status":"fail","block":100,"previous_block":100,
+                   "at_tip":false,"advancing":false,"interval_secs":300.19,
+                   "detail":"cardano-node: STALLED at block 100 — no progress in 300s while still behind the tip"}}}
+```
+
+### Scripting against it
+
+```bash
+# one verdict for the whole host
+sudo midnight-healthcheck --once | jq -r '.result.status'
+
+# only what needs attention
+sudo midnight-healthcheck --once | jq -r '.result.checks[] | select(.status != "ok") | "\(.status)\t\(.name)\t\(.reason)"'
+
+# is the node actually moving? true / false / null
+echo '{"jsonrpc":"2.0","id":1,"method":"check","params":{"name":"progress"}}' |
+  sudo midnight-healthcheck | jq '.result.components.midnight_node.advancing'
+```
+
+`--once` mirrors the verdict in its exit code — `0` healthy, `2` something failed — so cron and
+the systemd unit need no JSON parsing at all.
+
 ## On a timer
 
 ```bash
