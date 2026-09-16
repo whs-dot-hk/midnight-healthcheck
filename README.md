@@ -40,19 +40,33 @@ port was guessed is the most expensive noise there is.
 |---|---|
 | `progress` | **Is it moving?** Compares block heights against the previous run. Behind *and* advancing → `ok`, with a rate and a rough ETA. Behind and *not* advancing → `fail`. |
 | `chain_identity` | Is this the same chain, and roughly the same release, as the live network? Genesis mismatch is `fail`; a version skew is `warn`. |
-| `binaries` | Is each unit executing the binary that is on disk, or one replaced underneath it? |
-| `secrets` | Is the validator key material present, and readable only by its owner? |
+| `binaries` | Is each unit executing the binary that is on disk, or one replaced underneath it? `warn` if no checked unit is running at all, rather than a vacuous all-clear. |
+| `secrets` | Is the validator key material present, and readable only by its owner? `.env` and the `.seed` files are written by the validator stage — hours or days after the keys — so their absence before then is not a finding. |
 | `midnight`, `cardano_node`, `cardano_db_sync` | Process/unit liveness, RPC reachability, peers, db-sync lag. |
 | `disk`, `memory`, `load`, `uptime` | Host context. Reported, never counted toward overall health. |
 
 ### `progress` needs two runs
 
-It stores one observation (`/var/lib/midnight-healthcheck/state.json`, override with
-`HEALTHCHECK_STATE`) and compares against it. The first run records a baseline and reaches no
-verdict; so does any run less than 45 s after the previous one, which is reported rather than
-guessed at. A timer every 5 minutes is the intended use, and a longer interval also gives a
-steadier rate — a 60-second window is a noisy basis for an ETA, though it is perfectly good
-for deciding whether anything moved at all.
+It stores one observation per component (`/var/lib/midnight-healthcheck/state.json`, override
+with `HEALTHCHECK_STATE`; falls back to `~/.local/state/`, never `/tmp`) and compares against
+it. Each component has its own slot with its own timestamp, so `midnight` — which reaches the
+same verdict for itself, so that a monitor polling only that check still gets stall detection —
+cannot disturb `progress`'s baseline or vice versa.
+
+The rules that keep the verdict honest:
+
+* The first run records a baseline and reaches no verdict.
+* A run less than 45 s after the baseline reaches no verdict either — **and keeps the old
+  baseline**, so polling faster than the interval cannot starve detection.
+* A reading that could not be taken is reported as exactly that. It is never rounded to "at
+  the tip", and it does not overwrite a good baseline.
+* A block number that went **backwards** is a restart or a rollback (routine for db-sync, and
+  the prescribed remedy for a genesis mismatch) — reported as `warn` with the baseline reset,
+  not as a stall.
+
+A timer every 5 minutes is the intended use, and a longer interval also gives a steadier rate —
+a 60-second window is a noisy basis for an ETA, though perfectly good for deciding whether
+anything moved at all.
 
 ### Deliberate non-alarms
 
@@ -61,6 +75,11 @@ for deciding whether anything moved at all.
   until done, which looks exactly like a dead node) is reported as starting, not failed.
 * An **unreachable public RPC** is `warn`, not `fail`: not being able to check is a gap in
   knowledge, not evidence of a fault here.
+* The first-start index-build allowance applies **only** to the indexes `midnight-node`
+  itself creates, and only while its unit is active. db-sync's own index work, which can run
+  for hours, does not excuse a node that is actually down.
+* An **absent Prometheus endpoint** on the relay does not change the status when the tip was
+  read directly — but the reason says `peer count unknown`, because that is what it means.
 
 ## Running it
 
@@ -79,15 +98,20 @@ param:
 | `MIDNIGHT_RPC_URL` | probed: `http://127.0.0.1:9944`, then `:9933` |
 | `MIDNIGHT_NETWORK_RPC_URL` | `https://rpc.preprod.midnight.network` |
 | `CARDANO_NODE_SOCKET_PATH` | `/data/cardano/db/node.socket` |
-| `CARDANO_CLI` | first of `~midnight/.local/bin`, `/usr/local/bin`, `/usr/bin` |
-| `CARDANO_TESTNET_MAGIC` | `1` (preprod) |
+| `CARDANO_USER` | the `User=` of `cardano-node.service` |
+| `CARDANO_CLI` | first of that user's `~/.local/bin/cardano-cli`, `/usr/local/bin`, `/usr/bin` |
+| `CARDANO_NETWORK` / `CARDANO_TESTNET_MAGIC` | `preprod` / `1` |
 | `MIDNIGHT_NODE_DATA` | `/data/midnight_node` |
 | `MIDNIGHT_CHAIN_ID` | `midnight_preprod` |
 | `HEALTHCHECK_STATE` | `/var/lib/midnight-healthcheck/state.json` |
 
 `sudo` resets `PATH` to its `secure_path`, which excludes the service user's `~/.local/bin`
 where the installer puts `cardano-cli` — hence the absolute-path resolution rather than a
-lookup.
+lookup. The service user itself is read from the unit rather than assumed, because the setup
+script defaults it to whoever ran it.
+
+Every connection has a connect timeout as well as an I/O timeout, and the RPC port is probed
+once per process, so a hung or firewalled endpoint costs one timeout, not one per check.
 
 ## On a timer
 

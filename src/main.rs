@@ -444,9 +444,14 @@ fn help() {
                 echo '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"health\"}}' | ssh user@host midnight-healthcheck\n\
          \n\
          Methods: ping, health, checks, check, sysinfo, help\n\
-         Checks:  disk, memory, load, uptime, midnight, cardano_node, cardano_db_sync\n\
+         Checks:  disk, memory, load, uptime, midnight, cardano_node, cardano_db_sync,\n\
+                  progress, chain_identity, binaries, secrets\n\
          \n\
-         Env: MIDNIGHT_RPC_URL\n\
+         Env: MIDNIGHT_RPC_URL (default: probe 127.0.0.1:9944, then :9933)\n\
+              MIDNIGHT_NETWORK_RPC_URL (default https://rpc.preprod.midnight.network)\n\
+              CARDANO_USER (default: User= of cardano-node.service)  CARDANO_CLI\n\
+              MIDNIGHT_NODE_DATA (default /data/midnight_node)  MIDNIGHT_CHAIN_ID (default midnight_preprod)\n\
+              HEALTHCHECK_STATE (default /var/lib/midnight-healthcheck/state.json)\n\
               CARDANO_NODE_SOCKET_PATH (default /data/cardano/db/node.socket)\n\
               CARDANO_PROMETHEUS_URL (default http://127.0.0.1:12798/metrics)\n\
               CARDANO_NETWORK (default preprod) CARDANO_TESTNET_MAGIC (default 1)\n\

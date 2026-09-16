@@ -79,20 +79,35 @@ pub fn midnight_rpc_url(params: &Value) -> String {
             return u;
         }
     }
-    for port in [9944u16, 9933] {
-        let candidate = format!("http://127.0.0.1:{port}");
-        if nodes::rpc_call(&candidate, "system_health", json!([])).is_ok() {
-            return candidate;
-        }
-    }
-    "http://127.0.0.1:9944".into()
+    // Several checks need this; probing once per process rather than once per
+    // caller keeps a hung RPC from costing a timeout at every call site
+    static PROBED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PROBED
+        .get_or_init(|| {
+            for port in [9944u16, 9933] {
+                let candidate = format!("http://127.0.0.1:{port}");
+                if nodes::rpc_call(&candidate, "system_health", json!([])).is_ok() {
+                    return candidate;
+                }
+            }
+            "http://127.0.0.1:9944".into()
+        })
+        .clone()
 }
 
 /// On its first start the node builds its own indexes on the shared `cexplorer`
 /// and opens no ports until they are done. An unreachable RPC then means "starting",
 /// not "broken", and saying so is the difference between a useful alert and a
 /// false alarm every time a node is rebuilt.
-pub fn index_build_progress() -> Option<String> {
+pub fn index_build_progress(params: &Value) -> Option<String> {
+    // A build only explains an unreachable RPC if the node is actually running —
+    // a crashed unit is down, whatever db-sync happens to be doing at the time
+    if nodes::unit_active("midnight-node.service") != Some(true) {
+        return None;
+    }
+    let db = nodes::db_name(params);
+    // Only the indexes midnight-node itself creates on first start; db-sync's own
+    // index work, which can run for hours, must not be mistaken for it
     let out = nodes::run_cmd(
         "sudo",
         &[
@@ -101,9 +116,13 @@ pub fn index_build_progress() -> Option<String> {
             "postgres",
             "psql",
             "-d",
-            "cexplorer",
+            &db,
             "-tAc",
-            "SELECT phase, blocks_done, blocks_total FROM pg_stat_progress_create_index LIMIT 1;",
+            "SELECT p.phase, p.blocks_done, p.blocks_total FROM pg_stat_progress_create_index p \
+             JOIN pg_class c ON c.oid = p.index_relid \
+             WHERE p.datid = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+               AND c.relname IN ('idx_tx_out_address','idx_ma_tx_out_ident','idx_multi_asset_policy_name_hex') \
+             LIMIT 1;",
         ],
         &[],
     )
@@ -148,7 +167,7 @@ pub fn check_chain_identity(params: &Value) -> Value {
 
     if local_genesis.is_none() {
         // Distinguish "still starting" from "down" before raising anything
-        let (status, reason) = match index_build_progress() {
+        let (status, reason) = match index_build_progress(params) {
             Some(p) => (
                 "warn",
                 format!("local RPC not up yet: first-start index build in progress — {p}"),
@@ -284,11 +303,34 @@ pub fn check_binaries(params: &Value) -> Value {
         );
     }
 
+    let running: Vec<&String> = units
+        .iter()
+        .filter(|u| {
+            details
+                .get(*u)
+                .and_then(|d| d.get("running"))
+                .and_then(|r| r.as_bool())
+                == Some(true)
+        })
+        .collect();
     if stale.is_empty() {
+        let reason = if running.is_empty() {
+            "no checked unit is running; nothing to compare".to_string()
+        } else {
+            format!(
+                "{} running unit(s) executing the binary on disk: {}",
+                running.len(),
+                running
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         wrap(
             "binaries",
-            "ok",
-            "every running unit is executing the binary that is on disk",
+            if running.is_empty() { "warn" } else { "ok" },
+            &reason,
             json!({ "units": Value::Object(details) }),
         )
     } else {
@@ -330,7 +372,6 @@ pub fn check_secrets(params: &Value) -> Value {
         format!("{base}/keys/cross_chain.json"),
         format!("{network_dir}/secret_ed25519"),
         keystore.clone(),
-        format!("{base}/.env"),
         "/data/postgresql/fno-db-credentials.env".to_string(),
     ] {
         specs.push(SecretSpec {
@@ -338,8 +379,10 @@ pub fn check_secrets(params: &Value) -> Value {
             required: true,
         });
     }
-    // Written only once the validator stage has run
+    // Written only once the validator stage has run — which is gated on db-sync
+    // reaching the tip and can be hours or days after the keys exist
     for p in [
+        format!("{base}/.env"),
         format!("{base}/keys/aura.seed"),
         format!("{base}/keys/grandpa.seed"),
         format!("{base}/keys/cross_chain.seed"),

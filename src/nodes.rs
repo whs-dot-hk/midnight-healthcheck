@@ -75,7 +75,16 @@ fn parse_http_url(url: &str) -> Result<Url, String> {
 
 fn http_exchange(url: &str, method: &str, content_type: &str, body: &[u8]) -> Result<(u16, String), String> {
     let u = parse_http_url(url)?;
-    let mut stream = TcpStream::connect((u.host.as_str(), u.port)).map_err(|e| format!("connect {url}: {e}"))?;
+    // A plain connect() has no timeout of its own: against a host that drops SYNs
+    // it blocks for the kernel's retry budget (minutes), long enough to outlast any
+    // SSH wrapper or timer. Resolve, then connect with the same budget as the I/O.
+    use std::net::ToSocketAddrs;
+    let addr = (u.host.as_str(), u.port)
+        .to_socket_addrs()
+        .map_err(|e| format!("resolve {url}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("resolve {url}: no address"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, HTTP_TIMEOUT).map_err(|e| format!("connect {url}: {e}"))?;
     stream
         .set_read_timeout(Some(HTTP_TIMEOUT))
         .and_then(|_| stream.set_write_timeout(Some(HTTP_TIMEOUT)))
@@ -121,11 +130,17 @@ pub(crate) fn rpc_call(url: &str, method: &str, params: Value) -> Result<Value, 
 fn processes_matching(needles: &[&str]) -> Vec<Value> {
     let mut found = Vec::new();
     let Ok(dir) = fs::read_dir("/proc") else { return found };
+    // The binary is now called midnight-healthcheck, so a needle like "midnight"
+    // would match this very process (and the sudo/ssh wrappers carrying its name)
+    let me = std::process::id();
     for ent in dir.flatten() {
         let pid: u32 = match ent.file_name().to_string_lossy().parse() {
             Ok(p) => p,
             Err(_) => continue,
         };
+        if pid == me {
+            continue;
+        }
         let comm = fs::read_to_string(ent.path().join("comm")).unwrap_or_default();
         let comm = comm.trim();
         let cmdline = fs::read(ent.path().join("cmdline"))
@@ -262,24 +277,19 @@ fn substrate(name: &str, params: &Value, default_url: &str, env_url: &str, needl
             if should_have_peers && peers < min_peers {
                 status = "fail";
                 reason = format!("peers {peers} < min {min_peers}");
+            } else if procs.is_empty() {
+                status = "warn";
+                reason = "rpc ok but process not found in /proc".into();
             } else if is_syncing {
                 // Catching up is the normal state of a new node, and an initial sync
                 // runs for days: alarming on it would mean alarming continuously
                 // while nothing is wrong. Whether it is *advancing* is the question
-                // that matters, and the `progress` check is the one that can answer
-                // it — it compares against the previous run rather than guessing
-                // from a single reading.
-                status = "ok";
+                // that matters; the caller decides that against the previous run.
                 reason = match (block_height, lag) {
-                    (Some(b), Some(l)) => {
-                        format!("syncing: block {b}, {l} behind (see `progress` for whether it is advancing)")
-                    }
+                    (Some(b), Some(l)) => format!("syncing: block {b}, {l} behind"),
                     (Some(b), None) => format!("syncing: block {b}"),
                     _ => "syncing".into(),
                 };
-            } else if procs.is_empty() {
-                status = "warn";
-                reason = "rpc ok but process not found in /proc".into();
             }
             wrap(name, status, &reason, extra)
         }
@@ -297,17 +307,33 @@ pub fn check_midnight(params: &Value) -> Value {
         params,
         &probed,
         "MIDNIGHT_RPC_URL",
-        &["midnight-node", "midnight", "partner-chains-node"],
+        &["midnight-node", "partner-chains-node"],
     );
     if r.get("status").and_then(|s| s.as_str()) == Some("fail") {
         if let Some(false) = unit_active("midnight-node.service") {
             r["reason"] = json!(format!("{}; midnight-node.service not active", r["reason"].as_str().unwrap_or("")));
         }
     }
+    // A syncing node is only fine if it is *moving*. This check must be able to say
+    // so on its own — a monitor polling just `midnight` gets no help from `progress`
+    // — so it judges against its own slot in the state file. Its own slot, so that
+    // running alongside `progress` in one `health` call disturbs neither baseline.
+    if r.get("status").and_then(|s| s.as_str()) == Some("ok")
+        && r.get("is_syncing").and_then(|v| v.as_bool()) == Some(true)
+    {
+        let reading = crate::trend::midnight_reading(params);
+        let verdict = crate::trend::component("midnight_check", "midnight-node", &reading);
+        if verdict.status == "fail" {
+            r["status"] = json!("fail");
+            r["healthy"] = json!(false);
+        }
+        r["reason"] = json!(verdict.detail);
+        r["advancing"] = verdict.extra.get("advancing").cloned().unwrap_or(Value::Null);
+    }
     r
 }
 
-fn cardano_network_args(params: &Value) -> Vec<String> {
+pub(crate) fn cardano_network_args(params: &Value) -> Vec<String> {
     let magic = param_str(params, "testnet_magic", "CARDANO_TESTNET_MAGIC", "");
     if !magic.is_empty() {
         return vec!["--testnet-magic".into(), magic];
@@ -361,15 +387,12 @@ pub fn check_cardano_node(params: &Value) -> Value {
         let mut args = vec!["query".into(), "tip".into(), "--socket-path".into(), socket.clone()];
         args.extend(cardano_network_args(params));
         let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let user = crate::trend::cardano_user(params);
         let cli = crate::trend::resolve_binary(
             params,
             "cardano_cli",
             "CARDANO_CLI",
-            &[
-                "/home/midnight/.local/bin/cardano-cli",
-                "/usr/local/bin/cardano-cli",
-                "/usr/bin/cardano-cli",
-            ],
+            &crate::trend::cardano_cli_candidates(&user),
         );
         match run_cmd(&cli, &refs, &[]) {
             Ok(out) => {
@@ -416,8 +439,11 @@ pub fn check_cardano_node(params: &Value) -> Value {
         // Only a problem when it was the only way to see the node
         status = "warn";
     }
-    if block_height.is_some() {
+    if block_height.is_some() && !prom_ok {
+        // The tip answered, so the node is not down — but peers come only from
+        // Prometheus, and an unknown peer count must be said, not silently dropped
         reasons.retain(|r| !r.starts_with("prometheus"));
+        reasons.push("prometheus unreachable: peer count unknown".into());
     }
     if reasons.is_empty() {
         reasons.push(match block_height {
@@ -453,6 +479,18 @@ fn parse_pg_row(s: &str) -> Option<(i64, i64)> {
     let a = it.next()?.trim().parse().ok()?;
     let b = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0);
     Some((a, b))
+}
+
+/// The db-sync database, resolved the same way everywhere: explicit param, then
+/// `PGDATABASE`, then the credentials file the setup script writes, then the default
+pub(crate) fn db_name(params: &Value) -> String {
+    let creds = load_env_file(&param_str(params, "creds", "FNO_DB_CREDENTIALS", DEFAULT_CREDS));
+    param_str(
+        params,
+        "database",
+        "PGDATABASE",
+        creds.get("DB_NAME").map(|s| s.as_str()).unwrap_or("cexplorer"),
+    )
 }
 
 pub fn check_db_sync(params: &Value) -> Value {
