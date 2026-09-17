@@ -41,7 +41,7 @@ port was guessed is the most expensive noise there is.
 | `progress` | **Is it moving?** Compares block heights against the previous run. Behind *and* advancing → `ok`, with a rate and a rough ETA. Behind and *not* advancing → `fail`. |
 | `chain_identity` | Is this the same chain, and roughly the same release, as the live network? Genesis mismatch is `fail`; a version skew is `warn`. |
 | `binaries` | Is each unit executing the binary that is on disk, or one replaced underneath it? `warn` if no checked unit is running at all, rather than a vacuous all-clear. |
-| `secrets` | Is the validator key material present, and readable only by its owner? `.env` and the `.seed` files are written by the validator stage — hours or days after the keys — so their absence before then is not a finding. |
+| `secrets` | Is the validator key material present under `SECRET_ROOT` (`/secret`), and readable only by its owner? `.env` and the `.seed` files are written by the validator stage — hours or days after the keys — so their absence before then is not a finding. |
 | `midnight`, `cardano_node`, `cardano_db_sync` | Process/unit liveness, RPC reachability, peers, db-sync lag. |
 | `disk`, `memory`, `load`, `uptime` | Host context. Reported, never counted toward overall health. |
 
@@ -101,6 +101,7 @@ param:
 | `CARDANO_USER` | the `User=` of `cardano-node.service` |
 | `CARDANO_CLI` | first of that user's `~/.local/bin/cardano-cli`, `/usr/local/bin`, `/usr/bin` |
 | `CARDANO_NETWORK` / `CARDANO_TESTNET_MAGIC` | `preprod` / `1` |
+| `SECRET_ROOT` | `/secret` |
 | `MIDNIGHT_NODE_DATA` | `/data/midnight_node` |
 | `MIDNIGHT_CHAIN_ID` | `midnight_preprod` |
 | `HEALTHCHECK_STATE` | `/var/lib/midnight-healthcheck/state.json` |

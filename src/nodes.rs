@@ -17,7 +17,9 @@ const DBSYNC_LAG_WARN: i64 = 5;
 const DBSYNC_LAG_FAIL: i64 = 20; // installer: at most 20 counts as caught up
 const CARDANO_SYNC_OK: f64 = 99.99;
 const DEFAULT_SOCKET: &str = "/data/cardano/db/node.socket";
-const DEFAULT_CREDS: &str = "/data/postgresql/fno-db-credentials.env";
+/// Secrets live under one root (see check_secrets); the credentials file moved
+/// there with the rest, out of the PostgreSQL data directory
+const DEFAULT_CREDS: &str = "/secret/fno-db-credentials.env";
 const DEFAULT_PROM: &str = "http://127.0.0.1:12798/metrics";
 
 pub fn param_str(params: &Value, key: &str, env_key: &str, default: &str) -> String {
