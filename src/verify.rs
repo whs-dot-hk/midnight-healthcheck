@@ -354,25 +354,23 @@ struct SecretSpec {
 }
 
 pub fn check_secrets(params: &Value) -> Value {
-    let base = nodes::param_str(
-        params,
-        "midnight_data",
-        "MIDNIGHT_NODE_DATA",
-        "/data/midnight_node",
-    );
-    let chain = nodes::param_str(params, "chain_id", "MIDNIGHT_CHAIN_ID", "midnight_preprod");
-    let network_dir = format!("{base}/data/chains/{chain}/network");
-    let keystore = format!("{base}/data/chains/{chain}/keystore");
+    // Every secret lives under one root, pulled out of the node's runtime tree so
+    // it can be backed up and audited as a unit. The node is pointed at the node
+    // key and keystore explicitly (--node-key-file / --keystore-path) rather than
+    // deriving them from --base-path.
+    let root = nodes::param_str(params, "secret_root", "SECRET_ROOT", "/secret");
+    let network_dir = format!("{root}/node");
+    let keystore = format!("{root}/keystore");
 
     let mut specs: Vec<SecretSpec> = Vec::new();
     for p in [
-        format!("{base}/keys"),
-        format!("{base}/keys/aura.json"),
-        format!("{base}/keys/grandpa.json"),
-        format!("{base}/keys/cross_chain.json"),
+        format!("{root}/keys"),
+        format!("{root}/keys/aura.json"),
+        format!("{root}/keys/grandpa.json"),
+        format!("{root}/keys/cross_chain.json"),
         format!("{network_dir}/secret_ed25519"),
         keystore.clone(),
-        "/data/postgresql/fno-db-credentials.env".to_string(),
+        format!("{root}/fno-db-credentials.env"),
     ] {
         specs.push(SecretSpec {
             path: p,
@@ -382,10 +380,10 @@ pub fn check_secrets(params: &Value) -> Value {
     // Written only once the validator stage has run — which is gated on db-sync
     // reaching the tip and can be hours or days after the keys exist
     for p in [
-        format!("{base}/.env"),
-        format!("{base}/keys/aura.seed"),
-        format!("{base}/keys/grandpa.seed"),
-        format!("{base}/keys/cross_chain.seed"),
+        format!("{root}/.env"),
+        format!("{root}/keys/aura.seed"),
+        format!("{root}/keys/grandpa.seed"),
+        format!("{root}/keys/cross_chain.seed"),
     ] {
         specs.push(SecretSpec {
             path: p,
